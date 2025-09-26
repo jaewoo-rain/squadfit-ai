@@ -1,0 +1,27 @@
+version: "3.8"
+
+services:
+  coturn:
+    image: instrumentisto/coturn
+    container_name: coturn
+    volumes:
+      - ./turn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - ./turn/certs:/etc/certs:ro
+    ports:
+      - "3478:3478/udp"                    # STUN/TURN (UDP)
+      - "3478:3478/tcp"                    # TURN TCP (옵션)
+      - "443:443/tcp"                      # TURN over TLS (옵션)
+      - "49152-49200:49152-49200/udp"      # 릴레이 포트 범위
+    restart: unless-stopped
+
+  aiortc:
+    build: ./aiortc
+    container_name: aiortc
+    environment:
+      - AI_MODE=echo                       # echo / analyze
+      # - PYTHONUNBUFFERED=1                 # 로그 실시간
+    ports:
+      - "7000:7000"                        # FastAPI /offer
+    depends_on:
+      - coturn
+    restart: unless-stopped

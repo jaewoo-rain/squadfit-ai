@@ -1,0 +1,6 @@
+aiortc==1.7.0
+av==11.0.0            # ★ aiortc 1.7.0와 호환 (av<12)
+opencv-python-headless==4.10.0.84
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+numpy
