@@ -1,0 +1,78 @@
+name: spring-mysql-stack
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --max_connections=200
+    environment:
+      MYSQL_DATABASE: squadfit
+      MYSQL_USER: squadfit
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-squadfit_pw}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_pw}
+      TZ: Asia/Seoul
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # 초기 스크립트가 있으면 아래 주석 해제 후 ./mysql-init/*.sql 추가
+      # - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "3399:3306" # 호스트 3399 → MySQL 3306
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mysqladmin",
+          "ping",
+          "-h",
+          "127.0.0.1",
+          "-p${MYSQL_ROOT_PASSWORD:-root_pw}",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+    networks: [squadfit-net]
+    restart: unless-stopped
+
+  spring:
+    build: . # 현재 폴더에 Dockerfile, JAR가 있어야 합니다.
+    container_name: spring
+    # host-gateway: 컨테이너에서 호스트를 host.docker.internal 로 접근 가능하게
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      SERVER_PORT: "8080"
+
+      # ==== WebRTC 시그널/크레덴셜 ====
+      # 폰에 내려줄 TURN 주소(공인 IP)
+      TURN_HOST: "175.123.55.182"
+      # coturn과 동일한 HMAC 시크릿
+      TURN_AUTH_SECRET: ${TURN_AUTH_SECRET:-devsecret}
+      # Spring → ai 서버는 로컬 게이트웨이로 직접 호출(헤어핀 이슈 회피)
+      AI_OFFER_URL: "http://aiortc:7000/offer"
+
+      # ==== DB 연결 ====
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/squadfit?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul&characterEncoding=utf8"
+      SPRING_DATASOURCE_USERNAME: "squadfit"
+      SPRING_DATASOURCE_PASSWORD: "${MYSQL_PASSWORD:-squadfit_pw}"
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: "com.mysql.cj.jdbc.Driver"
+      SPRING_JPA_DATABASE_PLATFORM: "org.hibernate.dialect.MySQL8Dialect"
+      SPRING_JPA_HIBERNATE_DDL_AUTO: "update"
+      TZ: Asia/Seoul
+    ports:
+      - "8088:8080" # 호스트 8088 → Spring 8080 (8080 충돌 회피)
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks: [squadfit-net]
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+
+networks:
+  squadfit-net:
+    external: true

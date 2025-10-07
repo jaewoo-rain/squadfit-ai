@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   coturn:
     image: instrumentisto/coturn
@@ -8,20 +6,27 @@ services:
       - ./turn/turnserver.conf:/etc/coturn/turnserver.conf:ro
       - ./turn/certs:/etc/certs:ro
     ports:
-      - "3478:3478/udp"                    # STUN/TURN (UDP)
-      - "3478:3478/tcp"                    # TURN TCP (옵션)
-      - "443:443/tcp"                      # TURN over TLS (옵션)
-      - "49152-49200:49152-49200/udp"      # 릴레이 포트 범위
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      # - "443:443/tcp"   # TLS 쓸 때만
+      - "49152-49200:49152-49200/udp"
+    networks: [squadfit-net]
     restart: unless-stopped
 
   aiortc:
     build: ./aiortc
     container_name: aiortc
     environment:
-      - AI_MODE=echo                       # echo / analyze
-      # - PYTHONUNBUFFERED=1                 # 로그 실시간
+      - AI_MODE=analyze
+      - TURN_HOST=coturn # ⬅ 컨테이너끼리는 서비스명으로
+      - TURN_AUTH_SECRET=devsecret # ⬅ coturn과 동일한 시크릿
     ports:
-      - "7000:7000"                        # FastAPI /offer
+      - "7000:7000"
     depends_on:
       - coturn
+    networks: [squadfit-net]
     restart: unless-stopped
+
+networks:
+  squadfit-net:
+    external: true

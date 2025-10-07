@@ -1,66 +1,132 @@
 # ai.py
-import os
-import time
+import asyncio
+import json
 import logging
-from typing import Tuple
+import time
+import math
+import contextlib
+from typing import Awaitable, Callable
 
-import cv2
-import numpy as np
+import mediapipe as mp
 from av import VideoFrame
 from aiortc import MediaStreamTrack
 
-logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ai")
 
-DRAW_COLOR = tuple(int(x) for x in os.getenv("AI_DRAW_COLOR", "0,255,0").split(","))  # B,G,R
-DRAW_THICK = int(os.getenv("AI_DRAW_THICK", "3"))
+SendJson = Callable[[str], asyncio.Future | None]
+mp_hands = mp.solutions.hands
 
-class AnalyzedVideoTrack(MediaStreamTrack):
-    """
-    입력 영상(track)을 받아 간단한 '머리(얼굴) 추정 원'을 그린 뒤 다시 내보내는 예제 트랙.
-    성능/안정성을 위해 프레임 레이트를 약간 제한할 수도 있음.
-    """
-    kind = "video"
+try:
+    import orjson
+    def dumps(obj) -> str:
+        return orjson.dumps(obj).decode()
+except Exception:
+    def dumps(obj) -> str:
+        return json.dumps(obj, separators=(",", ":"))
 
-    def __init__(self, source: MediaStreamTrack):
-        super().__init__()  # base class 초기화
-        self.source = source
-        self._t0 = time.time()
-        self._cnt = 0
+def _distance(a, b):
+    return math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
 
-    async def recv(self) -> VideoFrame:
-        frame: VideoFrame = await self.source.recv()
+def start_hands_analyzer(video_track: MediaStreamTrack, send_json: SendJson) -> asyncio.Task:
+    async def _runner():
+        log.info("[AI] hands analyzer started")
 
-        # av.VideoFrame -> numpy (BGR)
-        img = frame.to_ndarray(format="bgr24")
+        target_fps = 30.0
+        min_interval = 1.0 / target_fps
+        last_sent = 0.0
 
-        # === 매우 간단한 '머리 위치' 가짜 추정: 가운데 얼굴 높이 정도에 원을 그림 ===
-        h, w, _ = img.shape
-        cx, cy = w // 2, int(h * 0.6)
-        radius = max(30, min(w, h) // 8)
+        PROCESS_SHORT_SIDE = 320
+        mirror_x = True
+        MAX_HANDS = 1
 
-        cv2.circle(img, (cx, cy), radius, DRAW_COLOR, DRAW_THICK)
-        cv2.putText(img, "AI: head-tracking demo", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, DRAW_COLOR, 2, cv2.LINE_AA)
+        hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=MAX_HANDS,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
 
-        # FPS 로그(1초 주기)
-        self._cnt += 1
-        now = time.time()
-        if now - self._t0 >= 1.0:
-            log.info("[AI] frames out/s = %d", self._cnt)
-            self._cnt = 0
-            self._t0 = now
+        send_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=3)
+        async def _sender():
+            while True:
+                msg = await send_queue.get()
+                try:
+                    await send_json(msg) if asyncio.iscoroutinefunction(send_json) else send_json(msg)
+                except Exception as e:
+                    log.debug("[AI] send_json error: %s", e)
+                finally:
+                    send_queue.task_done()
+        sender_task = asyncio.create_task(_sender())
 
-        # numpy -> av.VideoFrame (pts/time_base 유지)
-        out = VideoFrame.from_ndarray(img, format="bgr24")
-        out.pts = frame.pts
-        out.time_base = frame.time_base
-        return out
+        score = 0
+        prev_closed = False
 
-def build_analyzed_track(source: MediaStreamTrack) -> MediaStreamTrack:
-    """
-    외부에서 호출하는 팩토리 함수.
-    필요 시 여기에서 얼굴/포즈/손가락 등 실제 모델 로딩을 하고,
-    그 핸들(예: tflite 인터프리터)을 AnalyzedVideoTrack에 전달해도 됨.
-    """
-    return AnalyzedVideoTrack(source)
+        try:
+            while True:
+                frame: VideoFrame = await video_track.recv()
+                W, H = frame.width, frame.height
+
+                now = time.perf_counter()
+                if now - last_sent < min_interval:
+                    continue
+                last_sent = now
+
+                if W <= H:
+                    proc_w = PROCESS_SHORT_SIDE
+                    proc_h = int(round(H * (PROCESS_SHORT_SIDE / W)))
+                else:
+                    proc_h = PROCESS_SHORT_SIDE
+                    proc_w = int(round(W * (PROCESS_SHORT_SIDE / H)))
+
+                img_rgb = frame.to_ndarray(format="rgb24", width=proc_w, height=proc_h)
+                img_rgb.flags.writeable = False
+                results = hands.process(img_rgb)
+
+                pts = []
+                fist_closed = False
+
+                if results.multi_hand_landmarks:
+                    for hand_landmarks in results.multi_hand_landmarks[:MAX_HANDS]:
+                        for lm in hand_landmarks.landmark:
+                            x = int(lm.x * W)
+                            y = int(lm.y * H)
+                            if mirror_x:
+                                x = (W - 1) - x
+                            pts.append({"x": x, "y": y})
+
+                        # ----------- 주먹 판별 -------------
+                        tip_ids = [4, 8, 12, 16, 20]
+                        wrist = hand_landmarks.landmark[0]
+                        avg_tip_dist = sum(
+                            _distance(hand_landmarks.landmark[i], wrist) for i in tip_ids
+                        ) / len(tip_ids)
+                        # 경험적으로 0.15 이하이면 주먹
+                        if avg_tip_dist < 0.3:
+                            fist_closed = True
+
+                # 주먹 → 펴짐 이벤트로 점수 증가
+                if prev_closed and not fist_closed:
+                    score += 1
+                    log.info(f"[AI] Hand opened! Score={score}")
+                prev_closed = fist_closed
+
+                payload = {"size": {"w": W, "h": H}, "points": pts, "score": score}
+                msg = dumps(payload)
+
+                if send_queue.full():
+                    with contextlib.suppress(Exception):
+                        _ = send_queue.get_nowait()
+                        send_queue.task_done()
+                await send_queue.put(msg)
+
+        except asyncio.CancelledError:
+            log.info("[AI] hands analyzer cancelled")
+        except Exception as e:
+            log.exception("[AI] analyzer error: %s", e)
+        finally:
+            hands.close()
+            sender_task.cancel()
+            with contextlib.suppress(Exception):
+                await sender_task
+
+    return asyncio.create_task(_runner())
